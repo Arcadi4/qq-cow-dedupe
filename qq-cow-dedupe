@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""qq-cow-dedupe - reclaim space in QQ's media cache with APFS copy-on-write clones.
+
+QQ stores the same image bytes repeatedly (same picture re-sent in different
+months, the same bytes saved under both .jpg and .png, Emoji/ and Pic/ copies).
+Instead of deleting anything, this script replaces each byte-identical duplicate
+with an APFS clone of one canonical keeper: same path, same name, same bytes,
+same metadata - only the extent map is shared, so the blocks are freed.
+
+Dry-run is the default. Nothing is modified without --apply.
+
+  qq-cow-dedupe                 # report what could be saved
+  qq-cow-dedupe --apply         # quit QQ first
+  qq-cow-dedupe --apply --verify
+
+Exit codes: 0 ok, 1 error, 2 preflight failed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+
+CHUNK = 1 << 20
+QHEAD = 1 << 16
+DEFAULT_QQ = os.path.expanduser(
+    "~/Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ"
+)
+SKIP_EXT = {".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite-wal", ".lock"}
+TMP_SUFFIX = ".cowdedupe.tmp"
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or unit == "TiB":
+            return f"{n:,.1f} {unit}" if unit != "B" else f"{n:,.0f} B"
+        n /= 1024
+    return f"{n} B"
+
+
+def free_bytes(path: str) -> int:
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
+
+
+def clone_supported(directory: str) -> tuple[bool, str]:
+    """Probe clonefile(2) for real: it exists on every macOS, APFS is what works."""
+    src = os.path.join(directory, f".cowprobe.{os.getpid()}")
+    dst = src + ".clone"
+    try:
+        with open(src, "wb") as f:
+            f.write(b"probe" * 4096)
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.clonefile.restype = ctypes.c_int
+        libc.clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+        if libc.clonefile(src.encode(), dst.encode(), 0) != 0:
+            err = ctypes.get_errno()
+            return False, os.strerror(err) if err else f"errno {err}"
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+    finally:
+        for p in (dst, src):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def quick_hash(path: str, size: int) -> str | None:
+    """Cheap fingerprint: size is already known, so hash the first and last 64 KiB."""
+    h = hashlib.blake2b(digest_size=16)
+    try:
+        with open(path, "rb") as f:
+            h.update(f.read(QHEAD))
+            if size > 2 * QHEAD:
+                f.seek(-QHEAD, os.SEEK_END)
+                h.update(f.read(QHEAD))
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def full_hash(path: str) -> str | None:
+    h = hashlib.blake2b(digest_size=32)
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(CHUNK), b""):
+                h.update(block)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def qq_running() -> list[str]:
+    try:
+        out = subprocess.run(
+            ["pgrep", "-x", "QQ"], capture_output=True, text=True, check=False
+        ).stdout.split()
+    except OSError:
+        return []
+    return out
+
+
+def is_qq_tree(root: str) -> bool:
+    return root.startswith(DEFAULT_QQ) or "com.tencent.qq/" in root
+
+
+def find_root(explicit: str | None) -> str:
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    base = DEFAULT_QQ
+    if not os.path.isdir(base):
+        sys.exit(f"error: QQ data directory not found: {base}")
+    cands = []
+    for name in os.listdir(base):
+        if name.startswith("nt_qq_"):
+            nt_data = os.path.join(base, name, "nt_data")
+            if os.path.isdir(nt_data):
+                cands.append(nt_data)
+    if not cands:
+        sys.exit(f"error: no nt_qq_*/nt_data under {base} (use --root)")
+    # newest account directory wins; --root settles any ambiguity
+    return max(cands, key=os.path.getmtime)
+
+
+def stat_sig(path: str):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not os.path.isfile(path) or os.path.islink(path) or st.st_nlink > 1:
+        return None
+    return st
+
+
+def collect(root: str, min_size: int, min_age: float):
+    now = time.time()
+    by_size: dict[int, list[str]] = {}
+    n_files = n_bytes = 0
+    skipped = {"hardlink_or_special": 0, "too_small": 0, "too_new": 0}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for name in filenames:
+            if name.endswith(TMP_SUFFIX):
+                continue
+            path = os.path.join(dirpath, name)
+            st = stat_sig(path)
+            if st is None:
+                skipped["hardlink_or_special"] += 1
+                continue
+            if st.st_size < min_size:
+                skipped["too_small"] += 1
+                continue
+            if now - st.st_mtime < min_age:
+                skipped["too_new"] += 1
+                continue
+            if os.path.splitext(name)[1].lower() in SKIP_EXT:
+                continue
+            n_files += 1
+            n_bytes += st.st_size
+            by_size.setdefault(st.st_size, []).append(path)
+    return by_size, n_files, n_bytes, skipped
+
+
+def find_duplicates(by_size, progress=True):
+    """size -> candidates; quick hash; then full hash only for collisions."""
+    cands = [paths for size, paths in by_size.items() if len(paths) > 1]
+    total = sum(len(p) for p in cands)
+    if progress:
+        print(
+            f"  {len(cands):,} size buckets / {total:,} files to fingerprint",
+            file=sys.stderr,
+        )
+    quick: dict[tuple[int, str], list[str]] = {}
+    done = 0
+    for size, paths in by_size.items():
+        if len(paths) < 2:
+            continue
+        for path in paths:
+            q = quick_hash(path, size)
+            done += 1
+            if q is not None:
+                quick.setdefault((size, q), []).append(path)
+            if progress and done % 20000 == 0:
+                print(f"  fingerprinted {done:,}/{total:,}", file=sys.stderr)
+    groups: dict[str, list[str]] = {}
+    for (size, _q), paths in quick.items():
+        if len(paths) < 2:
+            continue
+        for path in paths:
+            digest = full_hash(path)
+            if digest:
+                groups.setdefault(f"{size}:{digest}", []).append(path)
+    return {k: v for k, v in groups.items() if len(v) > 1}
+
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_SP = ctypes.c_ssize_t
+_LIBC.listxattr.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+]
+_LIBC.listxattr.restype = _SP
+_LIBC.getxattr.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_uint32,
+    ctypes.c_int,
+]
+_LIBC.getxattr.restype = _SP
+_LIBC.setxattr.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_uint32,
+    ctypes.c_int,
+]
+_LIBC.setxattr.restype = ctypes.c_int
+_LIBC.removexattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+_LIBC.removexattr.restype = ctypes.c_int
+
+
+def get_xattrs(path: str) -> dict[bytes, bytes]:
+    bpath = os.fsencode(path)
+    size = _LIBC.listxattr(bpath, None, 0, 0)
+    if size <= 0:
+        return {}
+    buf = ctypes.create_string_buffer(size)
+    if _LIBC.listxattr(bpath, buf, size, 0) < 0:
+        return {}
+    attrs = {}
+    for name in buf.raw[:size].rstrip(b"\0").split(b"\0"):
+        if not name:
+            continue
+        n = _LIBC.getxattr(bpath, name, None, 0, 0, 0)
+        if n < 0:
+            continue
+        val = ctypes.create_string_buffer(max(n, 1))
+        if _LIBC.getxattr(bpath, name, val, n, 0, 0) < 0:
+            continue
+        attrs[name] = val.raw[:n]
+    return attrs
+
+
+def set_xattrs(path: str, attrs: dict[bytes, bytes], prune: bool) -> list[str]:
+    """Apply `attrs`; with prune, drop any xattr on `path` that isn't in `attrs`."""
+    bpath = os.fsencode(path)
+    errors = []
+    if prune:
+        size = _LIBC.listxattr(bpath, None, 0, 0)
+        if size > 0:
+            buf = ctypes.create_string_buffer(size)
+            if _LIBC.listxattr(bpath, buf, size, 0) >= 0:
+                for name in buf.raw[:size].rstrip(b"\0").split(b"\0"):
+                    if name and name not in attrs:
+                        _LIBC.removexattr(bpath, name, 0)
+    for name, val in attrs.items():
+        if _LIBC.setxattr(bpath, name, val, len(val), 0, 0) != 0:
+            errors.append(
+                f"{name.decode(errors='replace')}: {os.strerror(ctypes.get_errno())}"
+            )
+    return errors
+
+
+def clone_over(leader: str, dup: str) -> tuple[bool, str]:
+    """Replace `dup` with an APFS clone of `leader`, preserving dup's own metadata."""
+    tmp = dup + TMP_SUFFIX
+    try:
+        old = os.lstat(dup)
+        res = subprocess.run(
+            ["cp", "-c", "-p", leader, tmp], capture_output=True, text=True
+        )
+        if res.returncode != 0:
+            return False, (res.stderr or "cp failed").strip().splitlines()[-1]
+        new = os.lstat(tmp)
+        if new.st_size != old.st_size:
+            os.unlink(tmp)
+            return False, "clone size mismatch"
+        # cp -p copies the leader's metadata; restore the duplicate's own.
+        # xattrs first: the target may be read-only, and setxattr needs write access.
+        os.chmod(tmp, 0o600)
+        set_xattrs(tmp, get_xattrs(dup), prune=True)
+        os.chmod(tmp, old.st_mode & 0o7777)
+        if old.st_uid != new.st_uid or old.st_gid != new.st_gid:
+            try:
+                os.chown(tmp, old.st_uid, old.st_gid)
+            except OSError:
+                pass
+        if getattr(old, "st_flags", 0):
+            try:
+                os.chflags(tmp, old.st_flags)
+            except OSError:
+                pass
+        os.utime(tmp, ns=(old.st_atime_ns, old.st_mtime_ns))
+        os.replace(tmp, dup)
+        return True, ""
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False, f"{exc.strerror or exc}"
+
+
+def apply_groups(groups, root, state_path, verify, force):
+    applied = load_state(state_path) if (state_path and not force) else {}
+    freed = replaced = failed = skipped = 0
+    errors: list[str] = []
+    files_total = sum(len(v) - 1 for v in groups.values())
+    n = 0
+    for key, paths in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        if not force and key in applied:
+            skipped += len(paths) - 1
+            continue
+        paths = sorted(paths)
+        leader = paths[0]
+        lst = stat_sig(leader)
+        if lst is None:
+            errors.append(f"leader vanished: {leader}")
+            continue
+        for dup in paths[1:]:
+            n += 1
+            st = stat_sig(dup)
+            if st is None or st.st_size != lst.st_size:
+                continue  # changed since the scan
+            if st.st_dev != lst.st_dev:
+                continue
+            before = st.st_blocks * 512
+            ok, why = clone_over(leader, dup)
+            if not ok:
+                failed += 1
+                errors.append(f"{dup}: {why}")
+                continue
+            if verify:
+                after = stat_sig(dup)
+                if (
+                    after is None
+                    or after.st_size != lst.st_size
+                    or (
+                        quick_hash(dup, after.st_size)
+                        != quick_hash(leader, lst.st_size)
+                    )
+                ):
+                    failed += 1
+                    errors.append(f"{dup}: post-clone verification failed")
+                    continue
+            replaced += 1
+            freed += before
+            if state_path:
+                applied[key] = applied.get(key, 0) + 1
+            if n % 1000 == 0:
+                print(
+                    f"  {n:,}/{files_total:,} replaced, {human(freed)} freed",
+                    file=sys.stderr,
+                )
+        if state_path:
+            save_state(state_path, applied)
+    return replaced, freed, failed, skipped, errors
+
+
+def load_state(path: str) -> dict:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(path: str, data: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Deduplicate QQ media files with APFS clones (frees disk space)."
+    )
+    ap.add_argument(
+        "--root", help="directory to scan (default: newest nt_qq_*/nt_data)"
+    )
+    ap.add_argument(
+        "--apply", action="store_true", help="actually clone (default: dry run)"
+    )
+    ap.add_argument(
+        "--min-size", type=int, default=16 << 10, help="ignore smaller files"
+    )
+    ap.add_argument(
+        "--min-age",
+        type=float,
+        default=300,
+        help="skip files modified this recently (s)",
+    )
+    ap.add_argument("--verify", action="store_true", help="re-hash after each clone")
+    ap.add_argument(
+        "--force", action="store_true", help="ignore the applied-state cache"
+    )
+    ap.add_argument(
+        "--allow-running", action="store_true", help="apply while QQ is open"
+    )
+    ap.add_argument(
+        "--state", default=os.path.expanduser("~/.cache/qq-cow-dedupe/state.json")
+    )
+    ap.add_argument("--json", dest="json_out", help="write the group report as JSON")
+    ap.add_argument(
+        "--top", type=int, default=10, help="show N largest duplicate groups"
+    )
+    args = ap.parse_args(argv)
+
+    root = find_root(args.root)
+    ok, why = clone_supported(root)
+    if not ok:
+        print(
+            f"error: clonefile(2) unsupported on {root} ({why}); need APFS",
+            file=sys.stderr,
+        )
+        return 2
+    if args.apply and not args.allow_running and is_qq_tree(root) and qq_running():
+        print(
+            "error: QQ is running - quit it first (or pass --allow-running)",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"root: {root}", file=sys.stderr)
+    t0 = time.time()
+    by_size, n_files, n_bytes, skipped = collect(root, args.min_size, args.min_age)
+    print(
+        f"scanned {n_files:,} files, {human(n_bytes)} "
+        f"({skipped['hardlink_or_special']:,} hardlinked/special, "
+        f"{skipped['too_new']:,} too new) in {time.time() - t0:.0f}s",
+        file=sys.stderr,
+    )
+    groups = find_duplicates(by_size)
+    print(
+        f"found {len(groups):,} duplicate groups in {time.time() - t0:.0f}s",
+        file=sys.stderr,
+    )
+
+    dup_files = sum(len(v) - 1 for v in groups.values())
+    reclaimable = 0
+    rows = []
+    for key, paths in groups.items():
+        sizes = sorted((os.lstat(p).st_blocks * 512 for p in paths), reverse=True)
+        saved = sum(sizes[1:])
+        reclaimable += saved
+        rows.append(
+            {
+                "key": key,
+                "count": len(paths),
+                "size": sizes[0],
+                "reclaimable": saved,
+                "paths": sorted(paths),
+            }
+        )
+    rows.sort(key=lambda r: -r["reclaimable"])
+
+    print(
+        f"\n{dup_files:,} redundant files across {len(groups):,} groups; "
+        f"reclaimable {human(reclaimable)}"
+    )
+    if rows:
+        print(f"\nlargest groups:")
+        for r in rows[: args.top]:
+            name = os.path.basename(r["paths"][0])
+            print(
+                f"  {human(r['reclaimable']):>10}  x{r['count']:<3} "
+                f"{human(r['size']):>9}  {name}"
+            )
+            for p in r["paths"][:3]:
+                print(f"              {p.replace(root, '…')}")
+
+    if args.json_out:
+        with open(args.json_out, "w") as f:
+            json.dump({"root": root, "groups": rows}, f, indent=1)
+        print(f"\nreport: {args.json_out}", file=sys.stderr)
+
+    if not args.apply:
+        print(
+            f"\ndry run - nothing changed. re-run with --apply to free {human(reclaimable)}."
+        )
+        return 0
+
+    before_free = free_bytes(root)
+    print(f"\nfree before: {human(before_free)}", file=sys.stderr)
+    replaced, freed, failed, skipped_n, errors = apply_groups(
+        groups, root, args.state, args.verify, args.force
+    )
+    after_free = free_bytes(root)
+    print(
+        f"\nreplaced {replaced:,} files, skipped {skipped_n:,} (already done), "
+        f"{failed:,} failed"
+    )
+    print(f"blocks released: {human(freed)}")
+    print(
+        f"free space: {human(before_free)} -> {human(after_free)} "
+        f"({'+' if after_free >= before_free else ''}{human(after_free - before_free)})"
+    )
+    if errors:
+        print(f"\nfirst errors:")
+        for e in errors[:10]:
+            print(f"  {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
